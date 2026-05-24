@@ -9,20 +9,89 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
 
+type LearnerLevel =
+  | "new"
+  | "beginner"
+  | "intermediate"
+  | "advanced"
+  | "unknown";
+type CadencePreference = "tight" | "balanced" | "open";
+type ProjectScale = "small" | "medium" | "large";
+type FrictionLevel = "gentle" | "normal" | "challenging";
+type NoteKind =
+  | "concept"
+  | "review"
+  | "misconception"
+  | "decision"
+  | "pace"
+  | "general";
+
+interface SessionBrief {
+  objective?: string;
+  artifact?: string;
+  constraints?: string[];
+  suggestedTimebox?: string;
+  reviewTrigger?: string;
+  optionalBranches?: string[];
+}
+
 interface StudyState {
   active: boolean;
   topic: string;
   curriculumPath: string;
   progressPath: string;
-  learnerLevel?: "new" | "beginner" | "intermediate" | "advanced" | "unknown";
+  learnerLevel?: LearnerLevel;
   assessmentSummary?: string;
+  preferredCadence?: CadencePreference;
+  preferredProjectScale?: ProjectScale;
+  desiredFriction?: FrictionLevel;
+  currentArea?: string;
+  currentProject?: string;
+  currentMilestone?: string;
+  sessionBrief?: SessionBrief;
+  completedMilestones: string[];
+  notes: Array<{ at: string; text: string; kind?: NoteKind }>;
+  updatedAt: string;
+
+  // Legacy fields kept for migration from earlier study-state.json versions.
   currentModule?: string;
   currentLesson?: string;
-  completed: string[];
+  completed?: string[];
   nextStep?: string;
-  notes: Array<{ at: string; text: string }>;
-  updatedAt: string;
 }
+
+const SessionBriefParams = Type.Object({
+  objective: Type.Optional(
+    Type.String({ description: "Goal for the next bounded work block" }),
+  ),
+  artifact: Type.Optional(
+    Type.String({ description: "Concrete thing the learner should produce" }),
+  ),
+  constraints: Type.Optional(
+    Type.Array(
+      Type.String({
+        description: "Boundary, requirement, or success criterion",
+      }),
+    ),
+  ),
+  suggestedTimebox: Type.Optional(
+    Type.String({
+      description: "Suggested independent work duration, e.g. 30-90 minutes",
+    }),
+  ),
+  reviewTrigger: Type.Optional(
+    Type.String({
+      description: "When the learner should return for coaching/review",
+    }),
+  ),
+  optionalBranches: Type.Optional(
+    Type.Array(
+      Type.String({
+        description: "Optional curiosity branch or stretch direction",
+      }),
+    ),
+  ),
+});
 
 const ProgressParams = Type.Object({
   action: StringEnum([
@@ -30,14 +99,28 @@ const ProgressParams = Type.Object({
     "update",
     "complete",
     "note",
+    "set_session_brief",
     "set_next_step",
     "save",
   ] as const),
-  currentModule: Type.Optional(
-    Type.String({ description: "Current curriculum module" }),
+  currentArea: Type.Optional(
+    Type.String({ description: "Current broad exploration area" }),
   ),
-  currentLesson: Type.Optional(
-    Type.String({ description: "Current lesson or exercise" }),
+  currentProject: Type.Optional(
+    Type.String({ description: "Current project, artifact, or track" }),
+  ),
+  currentMilestone: Type.Optional(
+    Type.String({ description: "Current milestone or review focus" }),
+  ),
+  sessionBrief: Type.Optional(SessionBriefParams),
+  preferredCadence: Type.Optional(
+    StringEnum(["tight", "balanced", "open"] as const),
+  ),
+  preferredProjectScale: Type.Optional(
+    StringEnum(["small", "medium", "large"] as const),
+  ),
+  desiredFriction: Type.Optional(
+    StringEnum(["gentle", "normal", "challenging"] as const),
   ),
   learnerLevel: Type.Optional(
     StringEnum([
@@ -54,21 +137,47 @@ const ProgressParams = Type.Object({
         "Terse, neutral placement notes used only to adapt instruction; avoid biography or identity labels",
     }),
   ),
-  completedItem: Type.Optional(
+  completedMilestone: Type.Optional(
     Type.String({
-      description: "A newly completed item, checkpoint, or exercise",
+      description:
+        "A completed artifact, milestone, review, or substantial checkpoint",
     }),
   ),
   note: Type.Optional(
     Type.String({
-      description: "Brief learner progress note or misconception to remember",
+      description:
+        "Brief learner progress note, misconception, design decision, or pace preference",
     }),
   ),
-  nextStep: Type.Optional(
+  noteKind: Type.Optional(
+    StringEnum([
+      "concept",
+      "review",
+      "misconception",
+      "decision",
+      "pace",
+      "general",
+    ] as const),
+  ),
+  nextWorkBlock: Type.Optional(
     Type.String({
       description:
-        "The next meaningful work session, milestone, or exploration branch for the learner",
+        "Short fallback resume contract if no structured sessionBrief is supplied",
     }),
+  ),
+
+  // Backward-compatible aliases for older prompts/skills.
+  currentModule: Type.Optional(
+    Type.String({ description: "Legacy alias for currentArea" }),
+  ),
+  currentLesson: Type.Optional(
+    Type.String({ description: "Legacy alias for currentMilestone" }),
+  ),
+  completedItem: Type.Optional(
+    Type.String({ description: "Legacy alias for completedMilestone" }),
+  ),
+  nextStep: Type.Optional(
+    Type.String({ description: "Legacy alias for nextWorkBlock" }),
   ),
 });
 
@@ -109,41 +218,86 @@ function emptyState(cwd: string, topic = "unspecified topic"): StudyState {
     curriculumPath: curriculumPath(cwd),
     progressPath: progressPath(cwd),
     learnerLevel: "unknown",
-    completed: [],
+    preferredCadence: "balanced",
+    preferredProjectScale: "medium",
+    desiredFriction: "normal",
+    completedMilestones: [],
     notes: [],
     updatedAt: now,
   };
 }
 
-async function loadState(cwd: string): Promise<StudyState | undefined> {
-  const state = await readJson<StudyState>(statePath(cwd));
-  if (state) {
-    delete (state as StudyState & { srs?: unknown }).srs;
-    state.completed ??= [];
-    state.notes ??= [];
-    state.learnerLevel ??= "unknown";
+function migrateState(state: StudyState): StudyState {
+  delete (state as StudyState & { srs?: unknown }).srs;
+  state.completedMilestones ??= state.completed ?? [];
+  state.notes ??= [];
+  state.learnerLevel ??= "unknown";
+  state.preferredCadence ??= "balanced";
+  state.preferredProjectScale ??= "medium";
+  state.desiredFriction ??= "normal";
+  state.currentArea ??= state.currentModule;
+  state.currentMilestone ??= state.currentLesson;
+  if (!state.currentProject && state.currentLesson)
+    state.currentProject = state.currentLesson;
+  if (!state.sessionBrief && state.nextStep) {
+    state.sessionBrief = {
+      objective: state.nextStep,
+      reviewTrigger:
+        "Return with the artifact, a design note, output, or the first blocker that needs review.",
+    };
   }
   return state;
 }
 
+async function loadState(cwd: string): Promise<StudyState | undefined> {
+  const state = await readJson<StudyState>(statePath(cwd));
+  return state ? migrateState(state) : undefined;
+}
+
 async function saveState(cwd: string, state: StudyState): Promise<void> {
   state.updatedAt = new Date().toISOString();
+  state.completed = undefined;
+  state.currentModule = undefined;
+  state.currentLesson = undefined;
+  state.nextStep = undefined;
   await writeText(statePath(cwd), JSON.stringify(state, null, 2) + "\n");
   await writeProgressMarkdown(state);
 }
 
 function curriculumTemplate(topic: string): string {
-  return `# Study Curriculum: ${topic}\n\n> Generated by Pi Study Mode. Treat this as a living map, not a rigid syllabus.\n\n## Learning Goal\n\nDescribe what you want to be able to build, understand, or explore with ${topic}.\n\n## Placement / Starting Point\n\nBefore finalizing the plan, ask 3-5 short diagnostic questions to determine the learner's current level, goals, preferred project scale, feedback cadence, and desired pace. Keep placement notes terse and focused on learning needs, not biography. Update this section after checking their answers.\n\n- Placement level: unknown\n- Relevant starting assumptions, kept terse:\n- Current learning needs:\n- Gaps / misconceptions:\n- Time available:\n- Preferred project / practice style:\n- Desired review cadence and pace:\n\n## Exploration Zones\n\n1. Orientation and Tooling\n   - [ ] Set up a comfortable compile/run/test/debug loop\n   - [ ] Read one small real example and map unknowns\n   - [ ] Checkpoint: explain the workflow and choose a first project branch\n2. Core Concepts Through Programs\n   - [ ] Build a medium-sized program that forces the core ideas to appear naturally\n   - [ ] Keep an open questions / discoveries log\n   - [ ] Checkpoint: review code, behavior, and design tradeoffs\n3. Debugging and Revision\n   - [ ] Investigate compiler/runtime errors from the project\n   - [ ] Revise for correctness, clarity, and safety\n   - [ ] Checkpoint: compare before/after versions and name the lesson learned\n4. Applied Project Track\n   - [ ] Choose or design a substantial project milestone\n   - [ ] Work independently for a meaningful stretch\n   - [ ] Review artifact: code, tests, output, design notes, or failing case\n5. Reflection and Resume Points\n   - [ ] Record durable concepts, repeated weak spots, and project decisions as notes\n   - [ ] Save clear stopping points with the next concrete work session\n   - [ ] Decide the next exploration branch or deeper project\n\n## Running Progress\n\n- Current exploration area: TBD\n- Current project / artifact: TBD\n- Next meaningful work session: TBD\n- Open questions: TBD\n\n## Teacher Notes\n\nUse this section for durable observations about misconceptions, strengths, project ideas, review preferences, and questions to revisit.\n`;
+  return `# Study Curriculum: ${topic}\n\n> Generated by Pi Study Mode. Treat this as a living expedition map, not a rigid syllabus. The goal is: open-ended enough to explore; bounded enough to review.\n\n## Learning Goal\n\nDescribe what you want to be able to build, understand, or explore with ${topic}.\n\n## Placement / Starting Point\n\nBefore finalizing the map, ask 3-5 short diagnostic questions to determine the learner's current level, goals, preferred project scale, feedback cadence, desired pace, and appetite for challenge. Keep placement notes terse and focused on learning needs, not biography. Update this section after checking their answers.\n\n- Placement level: unknown\n- Current learning needs:\n- Gaps / misconceptions:\n- Preferred project scale: medium\n- Preferred cadence: balanced\n- Desired friction: normal\n\n## Exploration Tracks\n\n### Track A: Build Something Useful\n\nA medium-sized artifact that forces the main ideas to appear naturally. Each milestone should produce code, notes, tests, output, a design sketch, or a debugging trace that can be reviewed.\n\nPossible milestones:\n1. First working slice\n2. Real input/output or realistic data\n3. Error handling and edge cases\n4. Refactor after pain appears\n5. Explain design tradeoffs and next branches\n\n### Track B: Investigate and Compare\n\nRun experiments, inspect behavior, compare alternatives, and write observations. Use this when the learner is exploring a concept whose shape is not obvious yet.\n\nPossible milestones:\n1. Predict behavior before running\n2. Build a small experiment harness\n3. Compare 2-3 approaches\n4. Summarize the rule of thumb and where it breaks\n\n### Track C: Debugging and Revision Lab\n\nTake broken, naive, or incomplete work and improve it through review cycles. This is for learning from friction rather than avoiding it.\n\nPossible milestones:\n1. Reproduce the failure\n2. Form a hypothesis and test it\n3. Make the smallest useful fix\n4. Improve design/readability after correctness\n5. Record the durable lesson\n\n## Work Block Pattern\n\nMost study turns should assign one bounded work block, not a stream of tiny tasks. A good work block includes:\n\n- Objective\n- Artifact to produce\n- 2-4 constraints or success criteria\n- Suggested timebox, usually 30-90 minutes unless the learner asks for tighter coaching\n- Review trigger: when to return for feedback\n- Optional branches for curiosity or stretch\n\nBreak work into micro-steps only when the learner asks, is blocked, is very new to the topic, or a misconception would compound if left unchecked.\n\n## Running Progress\n\n- Current exploration area: TBD\n- Current project / artifact: TBD\n- Current milestone: TBD\n- Current work block: TBD\n- Open questions: TBD\n\n## Teacher Notes\n\nUse this section for durable observations about misconceptions, strengths, project ideas, review preferences, design decisions, and questions to revisit.\n`;
+}
+
+function briefLines(brief?: SessionBrief): string[] {
+  if (!brief) return ["- TBD"];
+  const lines: string[] = [];
+  if (brief.objective) lines.push(`- Objective: ${brief.objective}`);
+  if (brief.artifact) lines.push(`- Artifact: ${brief.artifact}`);
+  if (brief.suggestedTimebox)
+    lines.push(`- Suggested timebox: ${brief.suggestedTimebox}`);
+  if (brief.reviewTrigger)
+    lines.push(`- Review trigger: ${brief.reviewTrigger}`);
+  if (brief.constraints?.length) {
+    lines.push("- Constraints / success criteria:");
+    lines.push(...brief.constraints.map((item) => `  - ${item}`));
+  }
+  if (brief.optionalBranches?.length) {
+    lines.push("- Optional branches:");
+    lines.push(...brief.optionalBranches.map((item) => `  - ${item}`));
+  }
+  return lines.length ? lines : ["- TBD"];
 }
 
 function progressMarkdown(state: StudyState): string {
-  const completed = state.completed.length
-    ? state.completed.map((item) => `- [x] ${item}`).join("\n")
-    : "- No completed items recorded yet.";
+  const completed = state.completedMilestones.length
+    ? state.completedMilestones.map((item) => `- [x] ${item}`).join("\n")
+    : "- No completed milestones recorded yet.";
   const notes = state.notes.length
-    ? state.notes.map((n) => `- ${n.at}: ${n.text}`).join("\n")
+    ? state.notes
+        .map((n) => `- ${n.at}${n.kind ? ` [${n.kind}]` : ""}: ${n.text}`)
+        .join("\n")
     : "- No notes yet.";
-  return `# Study Progress: ${state.topic}\n\n- Active: ${state.active ? "yes" : "no"}\n- Placement level: ${state.learnerLevel ?? "unknown"}\n- Placement notes: ${state.assessmentSummary ?? "TBD"}\n- Current module: ${state.currentModule ?? "TBD"}\n- Current lesson: ${state.currentLesson ?? "TBD"}\n- Next meaningful work session: ${state.nextStep ?? "TBD"}\n- Last updated: ${state.updatedAt}\n\n## Resume Point\n\nTo continue, run \`/study resume\` from this project. The assistant should pick up from the current module/lesson and next meaningful work session above.\n\n## Completed\n\n${completed}\n\n## Notes\n\n${notes}\n\n## Files\n\n- Curriculum: ${state.curriculumPath}\n- State JSON: ${statePath(dirname(dirname(dirname(state.progressPath))))}\n`;
+  return `# Study Progress: ${state.topic}\n\n- Active: ${state.active ? "yes" : "no"}\n- Placement level: ${state.learnerLevel ?? "unknown"}\n- Placement notes: ${state.assessmentSummary ?? "TBD"}\n- Preferred cadence: ${state.preferredCadence ?? "balanced"}\n- Preferred project scale: ${state.preferredProjectScale ?? "medium"}\n- Desired friction: ${state.desiredFriction ?? "normal"}\n- Current area: ${state.currentArea ?? "TBD"}\n- Current project: ${state.currentProject ?? "TBD"}\n- Current milestone: ${state.currentMilestone ?? "TBD"}\n- Last updated: ${state.updatedAt}\n\n## Resume Work Block\n\nTo continue, run \`/study resume\` from this project. The assistant should orient briefly and continue from this bounded work block:\n\n${briefLines(state.sessionBrief).join("\n")}\n\n## Completed Milestones\n\n${completed}\n\n## Notes\n\n${notes}\n\n## Files\n\n- Curriculum: ${state.curriculumPath}\n- State JSON: ${statePath(dirname(dirname(dirname(state.progressPath))))}\n`;
 }
 
 async function writeProgressMarkdown(state: StudyState): Promise<void> {
@@ -162,15 +316,18 @@ async function ensureStudyFiles(
   state.topic = topic || state.topic;
   state.curriculumPath = curriculumPath(cwd);
   state.progressPath = progressPath(cwd);
-  state.completed ??= [];
-  state.notes ??= [];
-  state.learnerLevel ??= "unknown";
+  migrateState(state);
 
   if (!existsSync(state.curriculumPath)) {
     await writeText(state.curriculumPath, curriculumTemplate(state.topic));
   }
   await saveState(cwd, state);
   return state;
+}
+
+function briefSummary(brief?: SessionBrief): string {
+  if (!brief) return "TBD";
+  return brief.objective ?? brief.artifact ?? brief.reviewTrigger ?? "TBD";
 }
 
 function statusLines(state?: StudyState): string[] {
@@ -180,12 +337,26 @@ function statusLines(state?: StudyState): string[] {
     `Study mode: ${state.active ? "active" : "paused"}`,
     `Topic: ${state.topic}`,
     `Level: ${state.learnerLevel ?? "unknown"}`,
-    `Current: ${state.currentModule ?? "TBD"}${state.currentLesson ? ` / ${state.currentLesson}` : ""}`,
-    `Next: ${state.nextStep ?? "TBD"}`,
-    `Completed: ${state.completed.length}`,
+    `Cadence: ${state.preferredCadence ?? "balanced"}`,
+    `Current: ${state.currentArea ?? "TBD"}${state.currentProject ? ` / ${state.currentProject}` : ""}${state.currentMilestone ? ` / ${state.currentMilestone}` : ""}`,
+    `Work block: ${briefSummary(state.sessionBrief)}`,
+    `Completed milestones: ${state.completedMilestones.length}`,
     `Curriculum: ${state.curriculumPath}`,
     `Progress: ${state.progressPath}`,
   ];
+}
+
+function compactLabel(
+  text: string | undefined,
+  fallback: string,
+  maxWords: number,
+): string {
+  if (!text) return fallback;
+  const cleaned = text.replace(/^Module\s+\d+\s*:\s*/i, "").trim();
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.length > maxWords
+    ? `${words.slice(0, maxWords).join(" ")}…`
+    : cleaned;
 }
 
 function updateUi(ctx: ExtensionContext, state?: StudyState): void {
@@ -195,27 +366,21 @@ function updateUi(ctx: ExtensionContext, state?: StudyState): void {
     ctx.ui.setWidget("study-mode", undefined);
     return;
   }
-  ctx.ui.setStatus("study-mode", ctx.ui.theme.fg("accent", "📚 study"));
-  ctx.ui.setWidget("study-mode", [
-    ctx.ui.theme.fg("accent", `📚 ${state.topic}`),
-    ctx.ui.theme.fg(
-      "muted",
-      `Now: ${state.currentModule ?? "TBD"}${state.currentLesson ? ` / ${state.currentLesson}` : ""}`,
-    ),
-    ctx.ui.theme.fg(
-      "muted",
-      `Next: ${state.nextStep ?? "Ask the learner for a plan, artifact, or revision"}`,
-    ),
-    ctx.ui.theme.fg(
-      "dim",
-      "Use /study pause to stop here; /study resume to continue",
-    ),
-  ]);
+  const now = compactLabel(
+    state.currentArea ?? state.currentProject,
+    "study",
+    6,
+  );
+  ctx.ui.setStatus("study-mode", ctx.ui.theme.fg("accent", `📚 Now: ${now}`));
+  ctx.ui.setWidget("study-mode", undefined);
+}
+
+function sessionBriefPrompt(brief?: SessionBrief): string {
+  return briefLines(brief).join("\n");
 }
 
 function teachingPrompt(state: StudyState): string {
-  return `\n\n## PI STUDY MODE ACTIVE\n\nYou are tutoring the user on: ${state.topic}.\n\nPersistent files:\n- Curriculum: ${state.curriculumPath}\n- Progress: ${state.progressPath}\n\nCurrent progress:\n- Placement level: ${state.learnerLevel ?? "unknown"}\n- Placement notes: ${state.assessmentSummary ?? "TBD"} (use only to adapt difficulty; do not repeat or quote to the learner)\n- Exploration area: ${state.currentModule ?? "TBD"}\n- Project / milestone: ${state.currentLesson ?? "TBD"}\n- Next meaningful work session: ${state.nextStep ?? "TBD"}\n- Completed items: ${state.completed.length ? state.completed.join("; ") : "none yet"}
-\nMandatory teaching behavior:\n- DO NOT give the learner the finished answer by default. Act as a coach and reviewer, not an answer key.\n- If placement level is unknown, ask 3-5 short diagnostic questions before finalizing the curriculum. Include current goals, relevant starting point, preferred project scale, feedback cadence, desired pace, and only tiny skill checks that help choose a starting point.\n- Adapt the curriculum into an exploratory project map, not a rigid lesson ladder.\n- Prefer medium-sized programs, experiments, design sketches, debugging sessions, and revision cycles over isolated minutia drills.\n- Keep pace brisk and adaptive: once the learner has correctly predicted, implemented, or explained the core idea, advance to the next meaningful concept or integrate it into a larger artifact. Do not add extra micro-drills just because the topic has more edge cases.\n- Teach just enough theory to unblock the current project or exploration branch. Avoid nitpicking trivia unless it affects correctness, safety, debugging, or idiomatic use.\n- Do not repeat the learner's stored background, biography, job history, or assessment summary in normal replies. Use placement notes privately for difficulty calibration, and prefer evidence from the learner's current work over initial background assumptions.\n- Ask for the learner's plan, code, experiment result, design choice, or revision before revealing solutions.\n- Review work at natural checkpoints: say what is solid, identify the highest-impact issues, and suggest one or two meaningful revisions or branches.\n- Use escalating hints before any reveal. If the learner explicitly asks for the answer, first offer one more hint unless they insist.\n- Keep the curriculum and progress current. Use study_update_progress after meaningful progress, artifact completion, review, revision, a new misconception, a saved stopping point, or a new exploration branch.\n- Record durable concepts, repeated weak spots, and useful review observations as normal progress notes.\n- If the curriculum file is missing, too vague, or too lesson-drill oriented, create or improve it before continuing.\n`;
+  return `\n\n## PI STUDY MODE ACTIVE\n\nYou are tutoring the user on: ${state.topic}.\n\nPersistent files:\n- Curriculum: ${state.curriculumPath}\n- Progress: ${state.progressPath}\n\nCurrent progress:\n- Placement level: ${state.learnerLevel ?? "unknown"}\n- Placement notes: ${state.assessmentSummary ?? "TBD"} (use only to adapt difficulty; do not repeat or quote to the learner)\n- Preferred cadence: ${state.preferredCadence ?? "balanced"}\n- Preferred project scale: ${state.preferredProjectScale ?? "medium"}\n- Desired friction: ${state.desiredFriction ?? "normal"}\n- Exploration area: ${state.currentArea ?? "TBD"}\n- Project / artifact: ${state.currentProject ?? "TBD"}\n- Milestone / review focus: ${state.currentMilestone ?? "TBD"}\n- Current bounded work block:\n${sessionBriefPrompt(state.sessionBrief)}\n- Completed milestones: ${state.completedMilestones.length ? state.completedMilestones.join("; ") : "none yet"}\n\nMandatory teaching behavior:\n- DO NOT give the learner the finished answer by default. Act as a coach and reviewer, not an answer key.\n- If placement level is unknown, ask 3-5 short diagnostic questions before finalizing the curriculum. Include current goals, relevant starting point, preferred project scale, feedback cadence, desired pace, appetite for challenge, and only tiny skill checks that help choose a starting project.\n- After placement, propose 2-3 project tracks or expedition branches and ask the learner to choose or adapt one.\n- Prefer assigning ONE bounded work block per response over a stream of tiny tasks. A work block should include objective, artifact, 2-4 constraints/success criteria, a suggested timebox, a review trigger, and optional branches.\n- Default work-block size by cadence: tight = 10-25 minute checkpoints; balanced = 30-90 minute milestones; open = multi-hour or multi-session milestones with explicit review triggers.\n- Do not ask the learner to report back after every tiny substep. Let them work independently for a meaningful stretch.\n- Break into micro-steps only when the learner asks, is blocked, is very new to the topic, or a misconception would compound if left unchecked.\n- Prefer medium-sized programs, experiments, design sketches, debugging sessions, and revision cycles over isolated minutia drills.\n- Keep pace brisk and adaptive: once the learner has correctly predicted, implemented, or explained the core idea, advance to the next meaningful concept or integrate it into a larger artifact. Do not add extra micro-drills just because the topic has more edge cases.\n- Teach just enough theory to unblock the current project or exploration branch. Avoid nitpicking trivia unless it affects correctness, safety, debugging, or idiomatic use.\n- Do not repeat the learner's stored background, biography, job history, or assessment summary in normal replies. Use placement notes privately for difficulty calibration, and prefer evidence from the learner's current work over initial background assumptions.\n- Before revealing solutions, ask for the learner's plan, code, experiment result, design choice, or revision. For large work blocks, ask for an initial sketch only if it would prevent wasted effort.\n- Review work at natural checkpoints: say what is solid, identify the highest-impact issues, and suggest one or two meaningful revisions or branches.\n- Use escalating hints before any reveal. If the learner explicitly asks for the answer, first offer one more hint unless they insist.\n- Keep the curriculum and progress current. Use study_update_progress after meaningful progress, artifact completion, review, revision, a new misconception, a saved stopping point, pace/preference changes, or a new exploration branch.\n- Store the next resume point as a bounded work block, not a tiny instruction.\n- Record durable concepts, repeated weak spots, design decisions, pace preferences, and useful review observations as progress notes.\n- If the curriculum file is missing, too vague, or too lesson-drill oriented, create or improve it before continuing.\n`;
 }
 
 export default function studyMode(pi: ExtensionAPI): void {
@@ -269,7 +434,7 @@ export default function studyMode(pi: ExtensionAPI): void {
           "info",
         );
         pi.sendUserMessage(
-          `Study mode is now active for "${topic}". Before finalizing the curriculum, run a brief placement diagnostic: ask me 3-5 short questions to determine my current level, goals, preferred project scale, feedback cadence, and desired pace. Include only tiny skill checks that help choose a starting project. Ask a compact numbered set, then wait for my answers. After checking my responses, update study progress with learnerLevel and a terse, neutral assessmentSummary focused on learning needs, not biography. Do not repeat that summary back to me in normal replies; use it only to calibrate difficulty. Then tailor ${cachedState.curriculumPath} as an exploratory project map. Record durable concepts and weak spots as notes instead of separate review queues. Remember: do not give me finished answers; coach me through planning, writing, revising, and reviewing medium-sized programs, and move on once I demonstrate the core idea.`,
+          `Study mode is now active for "${topic}". Before finalizing the curriculum, run a brief placement diagnostic: ask me 3-5 short questions to determine my current level, goals, preferred project scale, feedback cadence, desired pace, and appetite for challenge. Include only tiny skill checks that help choose a starting project. Ask a compact numbered set, then wait for my answers. After checking my responses, update study progress with learnerLevel, preferredCadence, preferredProjectScale, desiredFriction, and a terse, neutral assessmentSummary focused on learning needs, not biography. Do not repeat that summary back to me in normal replies; use it only to calibrate difficulty. Then tailor ${cachedState.curriculumPath} as an exploratory project map. Propose 2-3 project tracks or expedition branches and ask me to choose or adapt one. Once chosen, give me a bounded work block large enough for a meaningful independent stretch, not a tiny task. Include objective, artifact, constraints/success criteria, suggested timebox, review trigger, and optional branches. Remember: open-ended enough to explore; bounded enough to review. Do not give me finished answers; coach me through planning, writing, revising, and reviewing medium-sized artifacts, and move on once I demonstrate the core idea.`,
         );
         return;
       }
@@ -292,13 +457,14 @@ export default function studyMode(pi: ExtensionAPI): void {
         if (argText)
           cachedState.notes.push({
             at: new Date().toISOString(),
+            kind: "general",
             text: `Paused: ${argText}`,
           });
         cachedState.active = false;
         await saveState(ctx.cwd, cachedState);
         updateUi(ctx, cachedState);
         ctx.ui.notify(
-          `Study mode paused. Resume later with /study resume. Next: ${cachedState.nextStep ?? "TBD"}`,
+          `Study mode paused. Resume later with /study resume. Work block: ${briefSummary(cachedState.sessionBrief)}`,
           "info",
         );
         return;
@@ -309,7 +475,7 @@ export default function studyMode(pi: ExtensionAPI): void {
         await saveState(ctx.cwd, cachedState);
         updateUi(ctx, cachedState);
         pi.sendUserMessage(
-          `Resume Study Mode for "${cachedState.topic}" from the saved progress. Orient me briefly, then continue from this next meaningful work session: ${cachedState.nextStep ?? "TBD"}. Current area: ${cachedState.currentModule ?? "TBD"}. Current milestone: ${cachedState.currentLesson ?? "TBD"}.`,
+          `Resume Study Mode for "${cachedState.topic}" from the saved progress. Orient me briefly, then continue from this bounded work block:\n${sessionBriefPrompt(cachedState.sessionBrief)}\nCurrent area: ${cachedState.currentArea ?? "TBD"}. Current project: ${cachedState.currentProject ?? "TBD"}. Current milestone: ${cachedState.currentMilestone ?? "TBD"}. If the saved block is too tiny or vague, replace it with a better bounded work block before continuing.`,
         );
         return;
       }
@@ -325,10 +491,10 @@ export default function studyMode(pi: ExtensionAPI): void {
     name: "study_update_progress",
     label: "Study Progress",
     description:
-      "Update or inspect Pi Study Mode progress files. Use this after meaningful learner progress, completed artifacts/reviews, important notes, pace/preferences, or changes to the next exploration step.",
+      "Update or inspect Pi Study Mode progress files. Use this after meaningful learner progress, completed artifacts/reviews, important notes, pace/preferences, or changes to the next bounded work block.",
     promptSnippet: "Update or inspect the active study curriculum progress",
     promptGuidelines: [
-      "Use study_update_progress whenever Study Mode is active and the learner completes a checkpoint/artifact, shows a misconception, changes exploration area/project, saves a stopping point, or receives a new meaningful work session.",
+      "Use study_update_progress whenever Study Mode is active and the learner completes a milestone/artifact, shows a misconception, changes exploration area/project, changes pace preferences, saves a stopping point, or receives a new bounded work block.",
     ],
     parameters: ProgressParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -337,24 +503,50 @@ export default function studyMode(pi: ExtensionAPI): void {
         state = await ensureStudyFiles(ctx.cwd, "unspecified topic");
       }
 
-      if (params.currentModule) state.currentModule = params.currentModule;
-      if (params.currentLesson) state.currentLesson = params.currentLesson;
+      const currentArea = params.currentArea ?? params.currentModule;
+      const currentMilestone = params.currentMilestone ?? params.currentLesson;
+      const completedMilestone =
+        params.completedMilestone ?? params.completedItem;
+      const nextWorkBlock = params.nextWorkBlock ?? params.nextStep;
+
+      if (currentArea) state.currentArea = currentArea;
+      if (params.currentProject) state.currentProject = params.currentProject;
+      if (currentMilestone) state.currentMilestone = currentMilestone;
       if (params.learnerLevel) state.learnerLevel = params.learnerLevel;
       if (params.assessmentSummary)
         state.assessmentSummary = params.assessmentSummary;
-      if (params.nextStep) state.nextStep = params.nextStep;
+      if (params.preferredCadence)
+        state.preferredCadence = params.preferredCadence;
+      if (params.preferredProjectScale)
+        state.preferredProjectScale = params.preferredProjectScale;
+      if (params.desiredFriction)
+        state.desiredFriction = params.desiredFriction;
+      if (params.sessionBrief) state.sessionBrief = params.sessionBrief;
+      if (nextWorkBlock && !params.sessionBrief) {
+        state.sessionBrief = {
+          ...(state.sessionBrief ?? {}),
+          objective: nextWorkBlock,
+          reviewTrigger:
+            state.sessionBrief?.reviewTrigger ??
+            "Return with the artifact, output, design notes, or the first blocker that needs review.",
+        };
+      }
       if (params.action === "save") state.active = false;
 
       if (
-        (params.action === "complete" || params.completedItem) &&
-        params.completedItem
+        (params.action === "complete" || completedMilestone) &&
+        completedMilestone
       ) {
-        if (!state.completed.includes(params.completedItem))
-          state.completed.push(params.completedItem);
+        if (!state.completedMilestones.includes(completedMilestone))
+          state.completedMilestones.push(completedMilestone);
       }
 
       if ((params.action === "note" || params.note) && params.note) {
-        state.notes.push({ at: new Date().toISOString(), text: params.note });
+        state.notes.push({
+          at: new Date().toISOString(),
+          kind: params.noteKind ?? "general",
+          text: params.note,
+        });
       }
 
       await saveState(ctx.cwd, state);
